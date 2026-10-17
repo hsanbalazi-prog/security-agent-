@@ -1,0 +1,218 @@
+"""Stage 3 -- decision arbitration (v2: policy + rewrite catalogue + Bayes/hysteresis).
+
+Decision table:
+  - no stage-2 findings on THIS action, but stage
+    1's posterior has cleared (risk, confidence)
+    for `hysteresis_consecutive_steps` in a row,
+    AND the action is consequential-or-sink (UER
+    guard, F3)                                     -> ESCALATE
+    (SEQ_RISK_ACCUMULATION: a per-action review
+    would have allowed this; the session-level
+    posterior is what catches a fragmented/
+    multi-step/adaptive attack)
+  - no findings and no hysteresis-confirmed
+    session risk                                    -> ALLOW
+  - any "hard" finding (not just missing
+    approval -- see stage2_policy.CONFIRMATION_KINDS)
+    at severity high/critical, AND a rewrite in
+    config/rewrites.yaml fully addresses every
+    current finding                                 -> REWRITE (F2: "rewrite
+                                                        is our highest-value
+                                                        lever for Precision;
+                                                        treat BLOCK as a last
+                                                        resort")
+  - ... same, but no rewrite fully addresses it     -> BLOCK
+  - only confirmation-kind findings remain, and
+    the candidate action is a plain tool_call       -> ESCALATE (this is what
+                                                        makes the harness ask
+                                                        the simulated human)
+  - only confirmation-kind findings remain, and
+    the candidate action is itself a
+    request_confirmation wrapper                    -> ALLOW (allowing the
+                                                        wrapper is what makes
+                                                        the harness ask the
+                                                        simulated human for
+                                                        *that* action; mirrors
+                                                        the shipped `provenance`
+                                                        baseline's handling of
+                                                        this action shape)
+  - only low/medium hard findings remain            -> ESCALATE (never
+                                                        silently allow a real
+                                                        finding, but don't
+                                                        block on weak
+                                                        evidence either)
+
+In every branch where stage 2 *did* find something, `bayes.risk` only nudges
+the reported `risk_score` upward (`max(severity_risk, bayes.risk)`) -- the
+decision *kind* is still driven by the deterministic policy findings. The
+Bayesian signal only drives the decision kind by itself in the first branch
+above, precisely because that is the one case a per-action policy review
+cannot cover at all.
+"""
+
+from __future__ import annotations
+
+from defense import ablation
+from defense.capabilities import default_registry
+from defense.context import DecisionContext
+from defense.models import DefenseDecision
+from defense.provenance import target_action
+from defense.rewrites import propose_rewrite
+from defense.stage1_bayes import BayesResult, cached_thresholds
+from defense.stage2_policy import PolicyVerdict
+
+SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+SEVERITY_RISK = {"low": 0.35, "medium": 0.55, "high": 0.8, "critical": 0.95}
+REWRITE_RISK_CAP = 0.6
+
+# A masking rewrite (mask_secret / mask_secret_response) provably removes the
+# exact flagged value from the outbound text -- re-scanned and verified in
+# rewrites.py before it's ever proposed -- unlike a substitution rewrite
+# (substitute_tool / downgrade_status), which only downgrades a still-
+# suspicious action without addressing why the model attempted it in the
+# first place. Real-Qwen3-8B re-verification (build step 10 follow-up) found
+# every one of 23 GEN-MASK-SECRET-IN-RESPONSE rewrites, and the sole
+# GEN-SECRET-IN-ANY-SINK-triggered case, landed on an action the harness
+# itself labelled legitimate -- the flat REWRITE_RISK_CAP (0.6, same as a
+# suspicion-downgrade) was reporting a calibration-breaking risk score for
+# something the defense had just verified was clean. Lower, not zero: a
+# masked secret is still evidence a canary was present in outbound text at
+# all, which is exactly what SECRET_IN_TEXT's own likelihood ratio already
+# says is meaningful -- reporting near-certainty of safety here would be its
+# own overconfidence, especially against scenarios this exact sample hasn't
+# seen. See config/likelihoods.yaml FIXLOG note on this same calibration
+# pass for the full before/after numbers.
+MASKING_REWRITE_KINDS = frozenset({"mask_secret", "mask_secret_response"})
+MASKING_REWRITE_RISK_CAP = 0.25
+MAX_REASON_CODES = 16
+MAX_EXPLANATION_CHARS = 500
+
+
+def _reason_codes(findings) -> list[str]:
+    return sorted({f.reason_code for f in findings})[:MAX_REASON_CODES]
+
+
+def _explanation(findings) -> str | None:
+    if not findings:
+        return None
+    text = "; ".join(f"{f.rule_id}: {f.message}" for f in findings)
+    return text[:MAX_EXPLANATION_CHARS]
+
+
+def _is_consequential_or_external_sink(ctx: DecisionContext) -> bool:
+    """UER guard boundary for the pure-accumulated-risk escalation branch.
+
+    Deliberately narrower than "any sink": a sink whose destination is fixed
+    to trusted_internal (case_note_create, incident_create, ticket_update,
+    incident_update -- writing a note or opening an incident) is exactly the
+    hard-negative case SENTINEL warns against over-blocking -- recording
+    untrusted-sourced facts internally is legitimate work, not a risk, no
+    matter how much session-level suspicion has accumulated elsewhere in the
+    run. Found as a real false positive during build step 7's ablation run
+    (SEQ_RISK_ACCUMULATION firing on a legitimate case_note_create /
+    incident_create call); see FIXLOG. Only a consequential action, or a
+    sink that could actually leave the organization ("dynamic" destination,
+    e.g. email), is in scope here."""
+    target = target_action(ctx.candidate_action)
+    if target.type != "tool_call" or target.tool is None:
+        return False
+    registry = default_registry()
+    if target.tool not in registry:
+        return False
+    capability = registry.get(target.tool)
+    if capability.is_consequential(target.arguments):
+        return True
+    return capability.sink and "dynamic" in capability.destination_tags
+
+
+def arbitrate(ctx: DecisionContext, policy: PolicyVerdict, bayes: BayesResult) -> DefenseDecision:
+    if not policy.findings:
+        config = cached_thresholds()
+        if bayes.hysteresis_met and (
+            not config.bayes_escalation_requires_consequential_or_sink or _is_consequential_or_external_sink(ctx)
+        ):
+            return DefenseDecision(
+                decision="escalate",
+                risk_score=bayes.risk,
+                confidence=bayes.confidence,
+                reason_codes=["SEQ_RISK_ACCUMULATION", *bayes.reason_codes][:MAX_REASON_CODES],
+                explanation="accumulated session risk crossed threshold across multiple steps; "
+                "no single action triggered a policy rule",
+            )
+        # `bayes.risk` is a SESSION-level posterior (P(this session is
+        # compromised)), not a per-action legitimacy score -- Brier/ECE are
+        # computed per DECISION, against whether THIS action is legitimate
+        # (docs/scoring.md). Reporting the raw session posterior here was a
+        # real calibration bug found during build step 7's ablation run: an
+        # action stage 2 found nothing wrong with, that we are simultaneously
+        # ALLOWing, would self-contradictorily report risk_score up to 0.99
+        # whenever session suspicion happened to still be elevated (even
+        # below the escalation threshold). Capped at the prior: a clean,
+        # allowed action's own risk is "baseline," never inflated by
+        # unrelated session history it didn't itself contribute evidence to.
+        risk_score = min(bayes.risk, config.prior_p_compromised)
+        return DefenseDecision(
+            decision="allow",
+            risk_score=round(risk_score, 4),
+            confidence=max(bayes.confidence, 0.6),
+            reason_codes=["POLICY_CLEAN"],
+            explanation=None,
+        )
+
+    hard = policy.hard_findings
+    confirmation_only = policy.confirmation_findings
+
+    if hard:
+        worst = max((f.severity for f in hard), key=lambda s: SEVERITY_RANK[s])
+        risk = max(SEVERITY_RISK[worst], bayes.risk)
+        if SEVERITY_RANK[worst] >= SEVERITY_RANK["high"]:
+            rewrite = propose_rewrite(ctx, policy.findings) if ablation.rewrites_enabled() else None
+            if rewrite is not None:
+                cap = MASKING_REWRITE_RISK_CAP if rewrite.kind in MASKING_REWRITE_KINDS else REWRITE_RISK_CAP
+                return DefenseDecision(
+                    decision="rewrite",
+                    risk_score=round(min(risk, cap), 4),
+                    confidence=0.75,
+                    reason_codes=_reason_codes(hard),
+                    explanation=(f"{rewrite.rewrite_id}: {rewrite.removed}. " + (_explanation(hard) or ""))[
+                        :MAX_EXPLANATION_CHARS
+                    ],
+                    rewritten_action=rewrite.rewritten,
+                    metadata={"rewrite_id": rewrite.rewrite_id, "removed": rewrite.removed},
+                )
+            return DefenseDecision(
+                decision="block",
+                risk_score=round(risk, 4),
+                confidence=0.8,
+                reason_codes=_reason_codes(hard),
+                explanation=_explanation(hard),
+            )
+        # low/medium hard findings only: real evidence, but not strong enough
+        # to block outright -- escalate rather than silently allow.
+        return DefenseDecision(
+            decision="escalate",
+            risk_score=round(risk, 4),
+            confidence=0.6,
+            reason_codes=_reason_codes(hard),
+            explanation=_explanation(hard),
+        )
+
+    # Only confirmation-kind findings remain (consequential_approval /
+    # forced_confirmation): the action is otherwise clean, it just has no
+    # recorded human approval yet.
+    risk = max(0.5, bayes.risk)
+    if ctx.candidate_action.type == "request_confirmation":
+        return DefenseDecision(
+            decision="allow",
+            risk_score=round(risk, 4),
+            confidence=0.7,
+            reason_codes=["CONFIRMATION_REQUESTED", *_reason_codes(confirmation_only)],
+            explanation=_explanation(confirmation_only),
+        )
+    return DefenseDecision(
+        decision="escalate",
+        risk_score=round(risk, 4),
+        confidence=0.7,
+        reason_codes=_reason_codes(confirmation_only),
+        explanation=_explanation(confirmation_only),
+    )
